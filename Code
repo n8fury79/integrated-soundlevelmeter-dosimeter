@@ -1,0 +1,785 @@
+/*
+ * Integrated Sound Level Meter and Dosimeter
+ *  
+ * Calibrate and change caloffset (suggested -11db as baseline)
+ * Wiring summary:
+ *   Microphone (INMP441)  : SD=32, WS=25, SCK=26, VDD=3.3V, L/R=GND
+ *   Display   (ILI9341)   : CS=22, DC=4, RST=5, MOSI=23, SCK=18, MISO=19
+ *   Reset button          : GPIO 15 → GND
+ *   Mode button           : GPIO 13 → GND
+ *
+ * WiFi: connect to "SoundDosimeter" / "12345678" then open http://192.168.4.1
+ */
+
+#include <FS.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <driver/i2s.h>
+#include <math.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+
+
+
+// ─── Pins ─────────────────────────────────────────────────────
+#define I2S_WS      25
+#define I2S_SCK     26
+#define I2S_SD      32
+#define I2S_PORT    I2S_NUM_0
+#define TFT_LED_PIN 17
+#define RESET_BTN   15
+#define MODE_BTN    13
+
+// ─── TFT colours ──────────────────────────────────────────────
+TFT_eSPI tft = TFT_eSPI();
+#define C_BG     0x0000
+#define C_PANEL  0x0841
+#define C_BORDER 0x2945
+#define C_WHITE  0xFFFF
+#define C_DIM    0x8410
+#define C_CYAN   0x07FF
+#define C_GREEN  0x07E0
+#define C_AMBER  0xFD20
+#define C_RED    0xF800
+
+// ─── WiFi ─────────────────────────────────────────────────────
+#define WIFI_SSID "SoundDosimeter"
+#define WIFI_PASS "12345678"
+WebServer* webServer = nullptr;
+
+// Sound processing block
+#define SAMPLE_RATE      48000
+#define SAMPLE_BITS      32
+#define MIC_OFFSET_DB    3.0103
+#define MIC_REF_DB       94.0
+#define MIC_OVERLOAD_DB  120.0
+#define MIC_NOISE_DB     33.0
+const double MIC_REF_AMPL = 420426.9;
+
+#define SAMPLES_SHORT  (SAMPLE_RATE / 8)   // 125ms = 6000 samples
+
+static float samples[SAMPLES_SHORT] __attribute__((aligned(4)));
+static float eq_samples[SAMPLES_SHORT] __attribute__((aligned(4))); // EQ-corrected copy for band filters
+
+struct SOS_Coeff { float b1, b2, a1, a2; };
+
+struct SOS_IIR_Filter {
+  float            gain;
+  const SOS_Coeff* sos;
+  int              stages;
+  float            w[4][2];
+
+  void reset() { memset(w, 0, sizeof(w)); }
+
+  float filter(float* src, float* dst, int n) {
+    float sum_sqr = 0.0f;
+    for (int i = 0; i < n; i++) {
+      float x = src[i] * gain;
+      for (int s = 0; s < stages; s++) {
+        float in  = x + sos[s].a1 * w[s][0] + sos[s].a2 * w[s][1];
+        float out = in + sos[s].b1 * w[s][0] + sos[s].b2 * w[s][1];
+        w[s][1] = w[s][0]; w[s][0] = in; x = out;
+      }
+      dst[i] = x; sum_sqr += x * x;
+    }
+    return sum_sqr;
+  }
+};
+
+// INMP441 EQ correction
+static const SOS_Coeff sos_inmp441[] = {
+  {-1.986920458344451f, +0.986963226946616f, +1.995178510504166f, -0.995184322194091f}
+};
+SOS_IIR_Filter MIC_EQ = { 1.00197834654696f, sos_inmp441, 1, {} };
+
+// A-weighting fs=48000
+static const SOS_Coeff sos_a_weight[] = {
+  {-2.00026996133106f, +1.00027056142719f, -1.060868438509278f, -0.163987445885926f},
+  {+4.35912384203144f, +3.09120265783884f, +1.208419926363593f, -0.273166998428332f},
+  {-0.70930303489759f, -0.29071868393580f, +1.982242159753048f, -0.982298594928989f}
+};
+SOS_IIR_Filter A_WEIGHT = { 0.169994948147430f, sos_a_weight, 3, {} };
+
+// Octave band filters fs=48000 (9 bands: 31.5Hz–8kHz)
+#define NUM_BANDS 9
+const char* bandLabel[NUM_BANDS] = {"31","63","125","250","500","1k","2k","4k","8k"};
+
+// Splits the sound into 9 frequency bands (like a graphic equaliser)
+// Each band covers one octave, from 31Hz bass up to 8kHz treble
+struct BandFilter {
+  float b0, a1, a2;  // b1=0, b2=-b0
+  float x1,x2,y1,y2;
+  void reset(){ x1=x2=y1=y2=0; }
+  float filter(float* src, int n){
+    float ss=0;
+    for(int i=0;i<n;i++){
+      float y = b0*src[i] - b0*x2 - a1*y1 - a2*y2;
+      x2=x1; x1=src[i]; y2=y1; y1=y;
+      ss+=y*y;
+    }
+    return ss;
+  }
+};
+
+// Band filter settings — one row per band, from lowest to highest frequency
+BandFilter octave[NUM_BANDS] = {
+  {0.00145569f, -1.99707163f, 0.99708861f, 0,0,0,0}, // 31.5Hz
+  {0.00290713f, -1.99411792f, 0.99418573f, 0,0,0,0}, // 63Hz
+  {0.00575147f, -1.98823087f, 0.98849705f, 0,0,0,0}, // 125Hz
+  {0.01143566f, -1.97607011f, 0.97712869f, 0,0,0,0}, // 250Hz
+  {0.02260089f, -1.95061285f, 0.95479823f, 0,0,0,0}, // 500Hz
+  {0.04411229f, -1.89541993f, 0.91177543f, 0,0,0,0}, // 1kHz
+  {0.08383492f, -1.76989502f, 0.83233015f, 0,0,0,0}, // 2kHz
+  {0.15022110f, -1.47186022f, 0.69955779f, 0,0,0,0}, // 4kHz
+  {0.23441238f, -0.76558762f, 0.53117524f, 0,0,0,0}, // 8kHz
+};
+
+// SumBlock carries A-weighted + 9 band energy sums
+struct SumBlock {
+  float sum_sqr_spl;
+  float sum_sqr_weighted;
+  float sum_sqr_band[NUM_BANDS];
+};
+QueueHandle_t samples_queue;
+
+double to_dB(double sum_sqr, uint32_t n) {
+  if (sum_sqr <= 0.0 || n == 0) return 0.0;
+  double rms = sqrt(sum_sqr / (double)n);
+  return MIC_OFFSET_DB + MIC_REF_DB + 20.0 * log10(rms / MIC_REF_AMPL);
+}
+
+// ─── I2S reader task — core 0 ─────────────────────────────────
+void i2s_reader_task(void*) {
+  const i2s_config_t cfg = {
+    .mode                 = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate          = SAMPLE_RATE,
+    .bits_per_sample      = i2s_bits_per_sample_t(SAMPLE_BITS),
+    .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
+    .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count        = 8,
+    .dma_buf_len          = SAMPLES_SHORT / 8,
+    .use_apll             = true,
+    .tx_desc_auto_clear   = false,
+    .fixed_mclk           = 0
+  };
+  const i2s_pin_config_t pins = {
+    .bck_io_num   = I2S_SCK,
+    .ws_io_num    = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num  = I2S_SD
+  };
+  i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pins);
+
+  MIC_EQ.reset(); A_WEIGHT.reset();
+  for(int b=0;b<NUM_BANDS;b++) octave[b].reset();
+
+  size_t bytes_read = 0;
+  // Discard first block — INMP441 startup transient
+  i2s_read(I2S_PORT, &samples, SAMPLES_SHORT * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+
+  while (true) {
+    i2s_read(I2S_PORT, &samples, SAMPLES_SHORT * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+
+    // Convert 32-bit I2S word → 24-bit float (shift out padding)
+    int32_t* raw = (int32_t*)samples;
+    for (int i = 0; i < SAMPLES_SHORT; i++)
+      samples[i] = (float)(raw[i] >> 8);
+
+    SumBlock q;
+    // Step 1: Fix the microphone's own frequency response
+    q.sum_sqr_spl      = MIC_EQ.filter(samples, eq_samples, SAMPLES_SHORT);
+    // Step 2: Split into 9 frequency bands
+    for(int b=0;b<NUM_BANDS;b++)
+      q.sum_sqr_band[b] = octave[b].filter(eq_samples, SAMPLES_SHORT);
+    // Step 3: Apply A-weighting so readings match what ears hear
+    q.sum_sqr_weighted = A_WEIGHT.filter(eq_samples, samples, SAMPLES_SHORT);
+
+    xQueueSend(samples_queue, &q, portMAX_DELAY);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Measurement state
+// ═══════════════════════════════════════════════════════════════
+float   currentDB=0, peakDB=0, leqDB=0;
+double  leq_sum_sqr=0; uint32_t leq_total_samp=0;
+float   dosePercent=0, twaDB=0;
+float   bandSPL[NUM_BANDS], bandPeak[NUM_BANDS];
+uint32_t sessionSec=0; uint32_t lastSecMs=0;
+bool    micConnected=false, buzzerActive=false;
+bool    lastReset=HIGH;
+
+#define HISTORY_LEN 60
+float   splHistory[HISTORY_LEN];
+uint8_t histIdx=0, histCount=0;
+
+#define DOSE_CRITERION 90.0f
+#define DOSE_HOURS      8.0f
+#define EXCHANGE_RATE   5.0f
+#define ALERT_SPL     115.0f
+#define ALERT_DOSE    100.0f
+
+// ─── Sessions ─────────────────────────────────────────────────
+// How many past sessions we save in the device's memory
+#define MAX_SESSIONS 5
+struct Session { uint32_t duration; float leq,peakSPL,dose,twa; };
+Session  sessions[MAX_SESSIONS];
+uint8_t  sessionCount=0;
+Preferences prefs;
+
+void formatTime(uint32_t s, char* buf){
+  sprintf(buf,"%02lu:%02lu:%02lu",s/3600,(s%3600)/60,s%60);
+}
+
+void saveSession(){
+  if(sessionSec<5) return;
+  for(int i=MAX_SESSIONS-1;i>0;i--) sessions[i]=sessions[i-1];
+  sessions[0]={sessionSec,leqDB,peakDB,dosePercent,(dosePercent>=0.01f)?twaDB:0.0f};
+  if(sessionCount<MAX_SESSIONS) sessionCount++;
+  prefs.putBytes("sessions",sessions,sizeof(sessions));
+  prefs.putUChar("scount",sessionCount);
+}
+
+bool needFullRedraw=true; // forward-declared for resetMeasurement
+void resetMeasurement(){
+  saveSession();
+  leq_sum_sqr=0; leq_total_samp=0;
+  leqDB=dosePercent=currentDB=peakDB=twaDB=0;
+  sessionSec=0; lastSecMs=millis(); histIdx=histCount=0;
+  for(int b=0;b<NUM_BANDS;b++){bandSPL[b]=0;bandPeak[b]=0;}
+  MIC_EQ.reset(); A_WEIGHT.reset();
+  for(int b=0;b<NUM_BANDS;b++) octave[b].reset();
+  needFullRedraw=true;
+}
+
+// ─── Screen state ─────────────────────────────────────────────
+uint8_t  screen=0;
+#define  NUM_SCREENS 3
+uint32_t lastPartialMs=0;
+int      specPrevH[NUM_BANDS], specPrevPkH[NUM_BANDS];
+
+// Screen drawing helpers
+uint16_t splColour(float spl){
+  if(spl>=90) return C_RED;
+  if(spl>=75) return C_AMBER;
+  return C_GREEN;
+}
+
+void drawHeader(const char* title){
+  tft.fillRect(0,0,320,24,C_PANEL);
+  tft.setTextColor(C_CYAN,C_PANEL); tft.setTextSize(2);
+  tft.setCursor(8,4); tft.print(title);
+  for(int i=0;i<NUM_SCREENS;i++)
+    tft.fillCircle(290+i*10,12,3,(i==screen)?C_CYAN:C_BORDER);
+  if(!micConnected){
+    tft.setTextSize(1); tft.setTextColor(C_AMBER,C_PANEL);
+    tft.setCursor(196,8); tft.print("NO MIC");
+  }
+  tft.drawFastHLine(0,24,320,C_BORDER);
+}
+
+void drawGradBar(int x,int y,int w,int h,float pct){
+  tft.fillRect(x,y,w,h,C_PANEL);
+  int filled=constrain((int)(pct*(float)w),0,w);
+  for(int i=0;i<filled;i++){
+    float p=(float)i/(float)w;
+    uint16_t c=(p<0.54f)?C_GREEN:(p<0.75f)?C_AMBER:C_RED;
+    tft.drawFastVLine(x+i,y,h,c);
+  }
+}
+
+// Screen 1: SPL + Dose — main measurement screen
+void drawSPLDose_full(){
+  tft.fillScreen(C_BG);
+  drawHeader("SPL + Dose");
+  tft.drawFastHLine(0,130,320,C_BORDER);
+  tft.setTextColor(C_DIM,C_BG); tft.setTextSize(2);
+  tft.setCursor(228,54); tft.print("dB");
+  tft.setTextSize(1);
+  tft.setCursor(8,136); tft.print("DOSE:");
+  tft.setCursor(8,172); tft.print("TWA:");
+  tft.setCursor(8,190); tft.print("Status:");
+  tft.setCursor(8,224); tft.print("BTN=screen   RST=save+reset");
+}
+
+void drawSPLDose_update(){
+  char buf[16];
+  tft.fillRect(0,28,222,62,C_BG);
+  tft.setTextColor(splColour(currentDB),C_BG); tft.setTextSize(5);
+  dtostrf(currentDB,5,1,buf); tft.setCursor(8,30); tft.print(buf);
+  drawGradBar(8,94,304,14,currentDB/140.0f);
+  tft.fillRect(0,112,320,16,C_BG);
+  tft.setTextSize(1);
+  tft.setTextColor(C_CYAN,C_BG);
+  tft.setCursor(8,114); tft.print("Leq:");
+  dtostrf(leqDB,5,1,buf); tft.print(buf); tft.print("dB");
+  tft.setTextColor(C_AMBER,C_BG);
+  tft.setCursor(170,114); tft.print("Peak:");
+  dtostrf(peakDB,4,1,buf); tft.print(buf); tft.print("dB");
+  float dp=min(dosePercent,9999.0f);
+  uint16_t dCol=(dp>=100)?C_RED:(dp>=50)?C_AMBER:C_GREEN;
+  tft.fillRect(56,132,250,20,C_BG);
+  tft.setTextColor(dCol,C_BG); tft.setTextSize(2);
+  tft.setCursor(56,134); dtostrf(dp,6,1,buf); tft.print(buf); tft.print("%");
+  drawGradBar(8,154,304,10,dp/100.0f);
+  tft.fillRect(42,168,278,18,C_BG); tft.setTextSize(1);
+  if(dosePercent<0.01f){tft.setTextColor(C_DIM,C_BG);tft.setCursor(42,172);tft.print("---");}
+  else{tft.setTextColor(C_CYAN,C_BG);tft.setCursor(42,172);dtostrf(twaDB,5,1,buf);tft.print(buf);tft.print(" dB");}
+  tft.fillRect(58,186,260,16,C_BG);
+  const char* risk; uint16_t rCol;
+  if(dp>=100){risk="OVEREXPOSED";rCol=C_RED;}
+  else if(dp>=50){risk="CAUTION";rCol=C_AMBER;}
+  else{risk="SAFE";rCol=C_GREEN;}
+  tft.setTextColor(rCol,C_BG); tft.setCursor(58,188); tft.print(risk);
+  tft.fillRect(0,204,320,18,C_BG);
+  tft.setTextColor(C_DIM,C_BG); tft.setTextSize(1);
+  formatTime(sessionSec,buf); tft.setCursor(200,206); tft.print(buf);
+  if(buzzerActive){tft.setTextColor(C_RED,C_BG);tft.setCursor(8,206);tft.print("!ALERT!");}
+}
+
+// Screen 2: Spectrum — shows the 9 frequency bands as a bar chart
+void drawSpectrum_full(){
+  tft.fillScreen(C_BG);
+  drawHeader("Octave bands");
+  const int barW=28,gap=5,startX=10,baseY=218,maxH=176;
+  for(int b=0;b<NUM_BANDS;b++){
+    int x=startX+b*(barW+gap);
+    tft.fillRect(x,baseY-maxH,barW,maxH,C_PANEL);
+    tft.setTextSize(1); tft.setTextColor(C_DIM,C_BG);
+    tft.setCursor(x+(barW-(int)strlen(bandLabel[b])*6)/2,baseY+3);
+    tft.print(bandLabel[b]);
+  }
+  memset(specPrevH,-1,sizeof(specPrevH));
+  memset(specPrevPkH,-1,sizeof(specPrevPkH));
+}
+
+void drawSpectrum_partial(){
+  const int barW=28,gap=5,startX=10,baseY=218,maxH=176;
+  for(int b=0;b<NUM_BANDS;b++){
+    int x=startX+b*(barW+gap);
+    int barH=constrain((int)(bandSPL[b]/140.0f*(float)maxH),0,maxH);
+    int pkH =constrain((int)(bandPeak[b]/140.0f*(float)maxH),0,maxH);
+    if(barH==specPrevH[b] && pkH==specPrevPkH[b]) continue;
+    tft.fillRect(x,baseY-maxH,barW,maxH,C_PANEL);
+    if(barH>0) tft.fillRect(x,baseY-barH,barW,barH,splColour(bandSPL[b]));
+    if(pkH>0)  tft.drawFastHLine(x,baseY-pkH,barW,C_AMBER);
+    tft.fillRect(x,baseY-maxH,barW,12,C_BG);
+    if(bandSPL[b]>15){
+      char tb[5]; sprintf(tb,"%.0f",bandSPL[b]);
+      tft.setTextSize(1); tft.setTextColor(C_WHITE,C_BG);
+      tft.setCursor(x+(barW-(int)strlen(tb)*6)/2,baseY-maxH);
+      tft.print(tb);
+    }
+    specPrevH[b]=barH; specPrevPkH[b]=pkH;
+  }
+}
+
+// Screen 3: Sessions — shows the last 5 saved sessions
+void drawSessions_full(){
+  tft.fillScreen(C_BG);
+  drawHeader("Sessions");
+  if(sessionCount==0){
+    tft.setTextColor(C_DIM,C_BG); tft.setTextSize(1);
+    tft.setCursor(72,110); tft.print("No sessions saved yet.");
+    tft.setCursor(48,126); tft.print("Press RST to save current session.");
+    return;
+  }
+  tft.setTextSize(1); tft.setTextColor(C_CYAN,C_BG);
+  tft.setCursor(8,30);   tft.print("#");
+  tft.setCursor(22,30);  tft.print("Duration");
+  tft.setCursor(106,30); tft.print("Leq");
+  tft.setCursor(152,30); tft.print("Peak");
+  tft.setCursor(198,30); tft.print("Dose%");
+  tft.setCursor(254,30); tft.print("TWA");
+  tft.drawFastHLine(0,40,320,C_BORDER);
+  char buf[16];
+  for(int i=0;i<sessionCount&&i<5;i++){
+    int y=44+i*36; uint16_t bg=(i%2==0)?C_PANEL:C_BG;
+    tft.fillRect(0,y,320,34,bg);
+    tft.setTextColor(C_WHITE,bg); tft.setTextSize(1);
+    tft.setCursor(8,y+8); tft.print(i+1);
+    formatTime(sessions[i].duration,buf); tft.setCursor(22,y+8); tft.print(buf);
+    tft.setTextColor(C_CYAN,bg);
+    dtostrf(sessions[i].leq,4,1,buf); tft.setCursor(106,y+8); tft.print(buf);
+    tft.setTextColor(C_AMBER,bg);
+    dtostrf(sessions[i].peakSPL,4,1,buf); tft.setCursor(152,y+8); tft.print(buf);
+    float d=sessions[i].dose;
+    tft.setTextColor((d>=100)?C_RED:(d>=50)?C_AMBER:C_GREEN,bg);
+    dtostrf(d,5,1,buf); tft.setCursor(198,y+8); tft.print(buf);
+    tft.setTextColor(C_WHITE,bg);
+    if(sessions[i].twa>0){dtostrf(sessions[i].twa,4,1,buf);}else{strcpy(buf,"---");}
+    tft.setCursor(254,y+8); tft.print(buf);
+  }
+}
+
+void drawScreen(){
+  switch(screen){
+    case 0: drawSPLDose_full(); drawSPLDose_update(); break;
+    case 1: drawSpectrum_full();                      break;
+    case 2: drawSessions_full();                      break;
+  }
+  needFullRedraw=false;
+}
+
+void partialUpdate(){
+  switch(screen){
+    case 0: drawSPLDose_update();   break;
+    case 1: drawSpectrum_partial(); break;
+    case 2:                         break;
+  }
+}
+
+// WiFi web dashboard — serves the live data to any phone or laptop connected
+void setHeaders(){
+  webServer->sendHeader("Connection","close");
+  webServer->sendHeader("Access-Control-Allow-Origin","*");
+  webServer->sendHeader("Cache-Control","no-cache, no-store, must-revalidate");
+  webServer->sendHeader("Pragma","no-cache"); webServer->sendHeader("Expires","0");
+}
+
+void handleData(){
+  setHeaders();
+  char ts[12]; formatTime(sessionSec,ts);
+  String hist="["; uint8_t cnt=min((int)histCount,(int)HISTORY_LEN);
+  for(int i=0;i<cnt;i++){uint8_t idx=(histIdx-cnt+i+HISTORY_LEN)%HISTORY_LEN;if(i>0)hist+=",";hist+=String(splHistory[idx],1);}
+  hist+="]";
+  String bands="["; for(int b=0;b<NUM_BANDS;b++){if(b>0)bands+=",";bands+=String(bandSPL[b],1);} bands+="]";
+  String peaks="["; for(int b=0;b<NUM_BANDS;b++){if(b>0)peaks+=",";peaks+=String(bandPeak[b],1);} peaks+="]";
+  String twaStr=(dosePercent>=0.01f)?String(twaDB,1):"null";
+  String json="{\"spl\":"+String(currentDB,1)+",\"leq\":"+String(leqDB,1)+
+    ",\"peak\":"+String(peakDB,1)+",\"dose\":"+String(dosePercent,2)+
+    ",\"twa\":"+twaStr+",\"time\":\""+String(ts)+"\""+
+    ",\"history\":"+hist+",\"bands\":"+bands+",\"peaks\":"+peaks+"}";
+  webServer->send(200,"application/json",json);
+}
+
+void handleSessions(){
+  setHeaders(); String json="[";
+  for(int i=0;i<sessionCount;i++){
+    if(i>0)json+=","; char ts[12]; formatTime(sessions[i].duration,ts);
+    String tw=(sessions[i].twa>0)?String(sessions[i].twa,1):"null";
+    json+="{\"n\":"+String(i+1)+",\"dur\":\""+String(ts)+"\",\"leq\":"+String(sessions[i].leq,1)+
+      ",\"peak\":"+String(sessions[i].peakSPL,1)+",\"dose\":"+String(sessions[i].dose,2)+",\"twa\":"+tw+"}";
+  }
+  json+="]"; webServer->send(200,"application/json",json);
+}
+
+void handleReset(){
+  setHeaders(); resetMeasurement();
+  webServer->send(200,"application/json","{\"ok\":true}");
+}
+
+void handleRoot(){
+  setHeaders();
+  webServer->setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer->send(200,"text/html","");
+  webServer->sendContent(F("<!DOCTYPE html><html><head>"
+    "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Sound Dosimeter</title><style>"
+    "*{box-sizing:border-box;margin:0;padding:0}"
+    "body{background:#0a0a0f;color:#e0e0e0;font-family:monospace}"
+    "header{background:#111;border-bottom:1px solid #222;padding:12px 16px;display:flex;align-items:center;justify-content:space-between}"
+    "header h1{font-size:1em;letter-spacing:2px;color:#00e5ff}"
+    "header span{font-size:0.7em;color:#aaa}"
+    ".tabs{display:flex;background:#111;border-bottom:1px solid #222}"
+    ".tab{flex:1;padding:10px;text-align:center;font-size:0.7em;letter-spacing:1px;color:#aaa;cursor:pointer;border-bottom:2px solid transparent}"
+    ".tab.active{color:#00e5ff;border-bottom:2px solid #00e5ff}"
+    ".page{display:none;padding:16px}.page.active{display:block}"
+    ".grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}"
+    ".card{background:#13131a;border:1px solid #222;border-radius:10px;padding:14px;text-align:center}"
+    ".card.warn{border-color:#ff6d00}.card.danger{border-color:#f44336}"
+    ".lbl{font-size:0.62em;letter-spacing:1px;color:#aaa;margin-bottom:5px}"
+    ".val{font-size:2em;font-weight:bold;color:#00e5ff;line-height:1}"
+    ".unit{font-size:0.7em;color:#aaa;margin-top:3px}"
+    ".bar-wrap{background:#111;border:1px solid #222;border-radius:6px;height:20px;overflow:hidden;margin-bottom:14px;position:relative}"
+    ".bar{height:100%;width:0%;transition:width 0.3s;background:linear-gradient(90deg,#00e5ff,#69f0ae,#ff9800,#f44336)}"
+    ".bar-lbl{position:absolute;right:6px;top:2px;font-size:0.65em;color:#fff}"
+    ".dose-bar-wrap{background:#111;border:1px solid #222;border-radius:6px;height:10px;overflow:hidden;margin-top:8px}"
+    ".dose-bar{height:100%;width:0%;transition:width 0.5s;background:linear-gradient(90deg,#69f0ae,#ff9800,#f44336)}"
+    ".chart-wrap{background:#13131a;border:1px solid #222;border-radius:10px;padding:12px;margin-bottom:14px}"
+    ".chart-lbl{font-size:0.62em;letter-spacing:1px;color:#aaa;margin-bottom:8px}"
+    "canvas{width:100%;display:block}"
+    ".spec-wrap{background:#13131a;border:1px solid #222;border-radius:10px;padding:12px;margin-bottom:14px}"
+    ".spec-grid{display:grid;grid-template-columns:repeat(9,1fr);gap:4px;align-items:end;height:140px}"
+    ".spec-band{display:flex;flex-direction:column;align-items:center;gap:2px}"
+    ".spec-bar-wrap{width:100%;background:#111;border-radius:3px;overflow:hidden;position:relative;height:100px}"
+    ".spec-bar{position:absolute;bottom:0;width:100%;background:#00e5ff;transition:height 0.2s;border-radius:2px 2px 0 0}"
+    ".spec-peak{position:absolute;width:100%;height:2px;background:#ff9800;transition:bottom 0.3s}"
+    ".spec-lbl{font-size:0.55em;color:#aaa;text-align:center}"
+    ".spec-val{font-size:0.6em;color:#ccc;text-align:center}"
+    ".btn{width:100%;padding:12px;background:#1a1a2e;border:1px solid #333;border-radius:8px;color:#e0e0e0;font-family:monospace;font-size:0.85em;cursor:pointer;letter-spacing:1px;margin-bottom:8px}"
+    ".btn:active{background:#00e5ff22}"
+    ".sess-card{background:#13131a;border:1px solid #222;border-radius:10px;padding:12px;margin-bottom:10px}"
+    ".sess-hdr{display:flex;justify-content:space-between;margin-bottom:8px}"
+    ".sess-num{color:#00e5ff;font-size:0.8em;font-weight:bold}.sess-dur{color:#aaa;font-size:0.75em}"
+    ".sess-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}"
+    ".sv{text-align:center}.sv .l{font-size:0.6em;color:#aaa}.sv .v{font-size:0.9em;color:#e0e0e0}"
+    ".no-sess{text-align:center;color:#888;padding:40px;font-size:0.8em}"
+    ".status{background:#111;border-top:1px solid #222;padding:6px 16px;font-size:0.65em;color:#aaa;display:flex;justify-content:space-between;position:fixed;bottom:0;left:0;right:0}"
+    ".dot{width:6px;height:6px;border-radius:50%;background:#69f0ae;display:inline-block;margin-right:4px;animation:pulse 2s infinite}"
+    "@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}"
+    ".spacer{height:40px}"
+    "</style></head><body>"));
+  webServer->sendContent(F(
+    "<header><h1>&#127908; SOUND DOSIMETER</h1><span id='ht'>--:--:--</span></header>"
+    "<div class='tabs'>"
+    "<div class='tab active' onclick='showTab(0)'>LIVE</div>"
+    "<div class='tab' onclick='showTab(1)'>SPECTRUM</div>"
+    "<div class='tab' onclick='showTab(2)'>CHART</div>"
+    "<div class='tab' onclick='showTab(3)'>SESSIONS</div>"
+    "</div>"
+    "<div class='page active' id='p0'><br>"
+    "<div class='grid'>"
+    "<div class='card' id='cspl'><div class='lbl'>INSTANT SPL</div><div class='val' id='vspl'>--.-</div><div class='unit'>dB(A)</div></div>"
+    "<div class='card'><div class='lbl'>Leq</div><div class='val green' id='vleq'>--.-</div><div class='unit'>dB(A)</div></div>"
+    "<div class='card'><div class='lbl'>PEAK</div><div class='val amber' id='vpeak'>--.-</div><div class='unit'>dB(A)</div></div>"
+    "<div class='card'><div class='lbl'>TWA</div><div class='val' id='vtwa'>---</div><div class='unit'>dB(A)</div></div>"
+    "</div>"
+    "<div class='bar-wrap'><div class='bar' id='splbar'></div><span class='bar-lbl' id='splbarlbl'>0 dB</span></div>"
+    "<div class='card' style='margin-bottom:14px'><div class='lbl'>NOISE DOSE</div>"
+    "<div class='val amber' id='vdose'>0.00</div><div class='unit'>% of 8-hour limit</div>"
+    "<div class='dose-bar-wrap'><div class='dose-bar' id='dosebar'></div></div></div>"
+    "<button class='btn' onclick='doReset()'>&#8635; RESET SESSION</button>"
+    "</div>"
+    "<div class='page' id='p1'><br>"
+    "<div class='spec-wrap'><div class='chart-lbl'>OCTAVE BAND SPECTRUM — dB(A)</div>"
+    "<div class='spec-grid' id='specgrid'></div></div>"
+    "<div class='grid'>"
+    "<div class='card'><div class='lbl'>DOMINANT BAND</div><div class='val' id='vdom' style='font-size:1.4em'>---</div></div>"
+    "<div class='card'><div class='lbl'>PEAK BAND SPL</div><div class='val amber' id='vdomspl'>--.-</div><div class='unit'>dB(A)</div></div>"
+    "</div><button class='btn' onclick='resetPeaks()'>RESET PEAK HOLD</button>"
+    "</div>"
+    "<div class='page' id='p2'><br>"
+    "<div class='chart-wrap'><div class='chart-lbl'>SPL HISTORY (~1.4 MIN)</div>"
+    "<canvas id='chart' height='100'></canvas></div>"
+    "<div class='grid'>"
+    "<div class='card'><div class='lbl'>MIN</div><div class='val green' id='cmin'>--</div><div class='unit'>dB(A)</div></div>"
+    "<div class='card'><div class='lbl'>MAX</div><div class='val red' id='cmax'>--</div><div class='unit'>dB(A)</div></div>"
+    "</div></div>"
+    "<div class='page' id='p3'><br>"
+    "<div id='slist'><div class='no-sess'>No sessions yet.</div></div><br>"
+    "<button class='btn' onclick='loadSessions()'>&#8635; REFRESH</button>"
+    "</div>"
+    "<div class='status'><span><span class='dot'></span>LIVE</span><span id='cstat'>connecting...</span></div>"
+    "<div class='spacer'></div>"));
+  webServer->sendContent(F("<script>"
+    "var tab=0,hist=[],bands=[],peaks=[];"
+    "var BL=['31Hz','63Hz','125Hz','250Hz','500Hz','1kHz','2kHz','4kHz','8kHz'];"
+    "function buildSpec(){var g=document.getElementById('specgrid');g.innerHTML='';"
+    "for(var i=0;i<9;i++){var d=document.createElement('div');d.className='spec-band';"
+    "d.innerHTML=\"<div class='spec-val' id='sv\"+i+\"'>--</div>\""
+    "+\"<div class='spec-bar-wrap'><div class='spec-bar' id='sb\"+i+\"' style='height:0'></div>\""
+    "+\"<div class='spec-peak' id='sp\"+i+\"' style='bottom:0'></div></div>\""
+    "+\"<div class='spec-lbl'>\"+BL[i]+\"</div>\";g.appendChild(d);}}buildSpec();"
+    "function splColor(v){return v>=90?'#f44336':v>=75?'#ff9800':'#00e5ff';}"
+    "function update(){fetch('/data?t='+Date.now()).then(r=>r.json()).then(d=>{"
+    "document.getElementById('vspl').textContent=d.spl.toFixed(1);"
+    "document.getElementById('vspl').style.color=splColor(d.spl);"
+    "document.getElementById('cspl').className='card'+(d.spl>=90?' danger':d.spl>=75?' warn':'');"
+    "document.getElementById('vleq').textContent=d.leq.toFixed(1);"
+    "document.getElementById('vpeak').textContent=d.peak.toFixed(1);"
+    "document.getElementById('vtwa').textContent=d.twa!==null?d.twa.toFixed(1):'---';"
+    "document.getElementById('vdose').textContent=d.dose.toFixed(2);"
+    "document.getElementById('ht').textContent=d.time;"
+    "document.getElementById('splbar').style.width=Math.min(100,(d.spl/140)*100)+'%';"
+    "document.getElementById('splbarlbl').textContent=d.spl.toFixed(1)+' dB';"
+    "document.getElementById('dosebar').style.width=Math.min(100,d.dose)+'%';"
+    "hist=d.history;bands=d.bands;peaks=d.peaks;"
+    "if(tab==1)updateSpec();if(tab==2)drawChart();"
+    "document.getElementById('cstat').textContent='Connected';"
+    "}).catch(()=>document.getElementById('cstat').textContent='Reconnecting...');}"
+    "function updateSpec(){if(!bands||!bands.length)return;"
+    "var mx=Math.max(...bands),di=bands.indexOf(mx);"
+    "document.getElementById('vdom').textContent=BL[di];"
+    "document.getElementById('vdomspl').textContent=mx.toFixed(1);"
+    "for(var i=0;i<9;i++){var p=Math.max(0,Math.min(100,(bands[i]/140)*100));"
+    "var pp=Math.max(0,Math.min(100,(peaks[i]/140)*100));"
+    "document.getElementById('sb'+i).style.height=p+'%';"
+    "document.getElementById('sb'+i).style.background=splColor(bands[i]);"
+    "document.getElementById('sp'+i).style.bottom=pp+'%';"
+    "document.getElementById('sv'+i).textContent=bands[i].toFixed(0);}}"
+    "function resetPeaks(){peaks=bands.slice();for(var i=0;i<9;i++)document.getElementById('sp'+i).style.bottom='0';}"
+    "function drawChart(){var c=document.getElementById('chart');"
+    "var dpr=window.devicePixelRatio||1;c.width=c.offsetWidth*dpr;c.height=100*dpr;"
+    "var ctx=c.getContext('2d');ctx.scale(dpr,dpr);var w=c.offsetWidth,h=100;"
+    "ctx.clearRect(0,0,w,h);if(!hist||hist.length<2)return;"
+    "var mn=Math.max(0,Math.min(...hist)-5),mx=Math.min(140,Math.max(...hist)+5);"
+    "ctx.strokeStyle='#222';ctx.lineWidth=1;"
+    "for(var g=0;g<=4;g++){var y=h-(g/4)*h;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();"
+    "ctx.fillStyle='#aaa';ctx.font='9px monospace';ctx.fillText(Math.round(mn+(g/4)*(mx-mn))+'dB',2,y-2);}"
+    "ctx.beginPath();ctx.strokeStyle='#00e5ff';ctx.lineWidth=2;"
+    "hist.forEach(function(v,i){var x=i/(hist.length-1)*w,y=h-((v-mn)/(mx-mn))*h;"
+    "i==0?ctx.moveTo(x,y):ctx.lineTo(x,y);});ctx.stroke();"
+    "document.getElementById('cmin').textContent=Math.min(...hist).toFixed(1);"
+    "document.getElementById('cmax').textContent=Math.max(...hist).toFixed(1);}"
+    "function loadSessions(){fetch('/sessions?t='+Date.now()).then(r=>r.json()).then(function(arr){"
+    "var el=document.getElementById('slist');"
+    "if(!arr.length){el.innerHTML=\"<div class='no-sess'>No sessions yet.</div>\";return;}"
+    "el.innerHTML=arr.map(function(s){return \"<div class='sess-card'><div class='sess-hdr'>\""
+    "+\"<span class='sess-num'>SESSION #\"+s.n+\"</span><span class='sess-dur'>\"+s.dur+\"</span></div>\""
+    "+\"<div class='sess-grid'>\""
+    "+\"<div class='sv'><div class='l'>Leq</div><div class='v'>\"+s.leq.toFixed(1)+\"dB</div></div>\""
+    "+\"<div class='sv'><div class='l'>PEAK</div><div class='v'>\"+s.peak.toFixed(1)+\"dB</div></div>\""
+    "+\"<div class='sv'><div class='l'>DOSE</div><div class='v'>\"+s.dose.toFixed(2)+\"%</div></div>\""
+    "+\"<div class='sv'><div class='l'>TWA</div><div class='v'>\"+(s.twa!==null?s.twa.toFixed(1)+'dB':'---')+\"</div></div>\""
+    "+\"<div class='sv' style='grid-column:span 2'><div class='l'>DURATION</div><div class='v'>\"+s.dur+\"</div></div>\""
+    "+\"</div></div>\";}).join('');});}"
+    "function doReset(){if(!confirm('Save and reset current session?'))return;"
+    "fetch('/reset?t='+Date.now()).then(()=>loadSessions());}"
+    "function showTab(n){document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',i==n));"
+    "document.querySelectorAll('.page').forEach((p,i)=>p.classList.toggle('active',i==n));tab=n;if(n==3)loadSessions();}"
+    "update();setInterval(update,1000);"
+    "</script></body></html>"));
+  webServer->sendContent("");
+}
+
+// Runs once at power-on
+void setup(){
+  Serial.begin(115200); delay(500);
+  Serial.println(F("BUILD: v20-dsp"));
+
+  pinMode(RESET_BTN,INPUT_PULLUP);
+  pinMode(MODE_BTN, INPUT_PULLUP);
+  pinMode(19,INPUT_PULLUP); // MISO pullup — prevents TFT GRAM noise
+  pinMode(TFT_LED_PIN,OUTPUT); digitalWrite(TFT_LED_PIN,HIGH);
+
+  // Restart the display chip so it starts fresh
+  pinMode(5,OUTPUT); pinMode(22,OUTPUT); pinMode(4,OUTPUT);
+  digitalWrite(22,HIGH); digitalWrite(5,HIGH); delay(10);
+  digitalWrite(5,LOW);   delay(20);
+  digitalWrite(5,HIGH);  delay(150);
+
+  tft.init();
+  tft.setRotation(3);
+  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(TFT_BLACK);
+
+  tft.setTextColor(C_CYAN,C_BG); tft.setTextSize(2);
+  tft.setCursor(50,100); tft.print("Sound Dosimeter");
+  tft.setTextColor(C_DIM,C_BG); tft.setTextSize(1);
+  tft.setCursor(90,124); tft.print("v20-dsp  booting...");
+
+  prefs.begin("dosimeter",false);
+  sessionCount=prefs.getUChar("scount",0);
+  if(sessionCount>0) prefs.getBytes("sessions",sessions,sizeof(sessions));
+
+  // Start the microphone task running on the second processor core
+  samples_queue = xQueueCreate(8, sizeof(SumBlock));
+  xTaskCreatePinnedToCore(i2s_reader_task,"I2S",8192,NULL,4,NULL,0);
+
+  WiFi.softAP(WIFI_SSID,WIFI_PASS);
+  IPAddress ip=WiFi.softAPIP();
+  Serial.print(F("IP: ")); Serial.println(ip);
+
+  webServer=new WebServer(80);
+  webServer->on("/",        handleRoot);
+  webServer->on("/data",    handleData);
+  webServer->on("/sessions",handleSessions);
+  webServer->on("/reset",   handleReset);
+  webServer->begin();
+
+  // Show WiFi connection info while system finishes starting up
+  tft.fillScreen(C_BG);
+  tft.setTextColor(C_CYAN,C_BG); tft.setTextSize(2);
+  tft.setCursor(30,80); tft.print("Sound Dosimeter");
+  tft.setTextColor(C_DIM,C_BG); tft.setTextSize(1);
+  tft.setCursor(30,110); tft.print("WiFi : SoundDosimeter");
+  tft.setCursor(30,124); tft.print("Pass : 12345678");
+  tft.setCursor(30,138); tft.print("URL  : http://"); tft.print(ip);
+  tft.setCursor(30,160); tft.print("Initialising...");
+  delay(2000);
+  tft.fillScreen(C_BG);
+  delay(100);
+
+  lastSecMs=millis();
+  needFullRedraw=true;
+}
+
+// Runs over and over — checks for new measurements, button presses, and updates the screen
+void loop(){
+  SumBlock q;
+
+  // Grab any fresh audio measurements from the mic task
+  while(xQueueReceive(samples_queue, &q, 0)==pdTRUE){
+    double spl_dB      = to_dB(q.sum_sqr_spl, SAMPLES_SHORT);
+    double weighted_dB = to_dB(q.sum_sqr_weighted, SAMPLES_SHORT);
+
+    bool overloaded = (spl_dB > MIC_OVERLOAD_DB);
+    bool too_quiet  = (weighted_dB < MIC_NOISE_DB || isnan(weighted_dB));
+    micConnected    = (!isnan(spl_dB) && spl_dB > MIC_NOISE_DB);
+
+    if(!overloaded && !too_quiet){
+      currentDB = (float)weighted_dB;
+      if(currentDB > peakDB) peakDB = currentDB;
+
+      // Running average sound level (energy-averaged, not simple average)
+      leq_sum_sqr    += q.sum_sqr_weighted;
+      leq_total_samp += SAMPLES_SHORT;
+      if(leq_total_samp>0)
+        leqDB=(float)to_dB(leq_sum_sqr, leq_total_samp);
+
+      // Work out what fraction of the safe daily noise dose has been used up
+      float T=DOSE_HOURS/powf(2.0f,(currentDB-DOSE_CRITERION)/EXCHANGE_RATE);
+      if(T>0){
+        float dt=(float)SAMPLES_SHORT/(float)SAMPLE_RATE/3600.0f;
+        dosePercent+=(dt/T)*100.0f;
+      }
+      if(dosePercent>=0.01f){
+        twaDB=90.0f+EXCHANGE_RATE*log2f(dosePercent/100.0f);
+        if(twaDB<0) twaDB=0;
+      }
+
+      // Store the sound level for each frequency band
+      for(int b=0;b<NUM_BANDS;b++){
+        float sp=(float)to_dB(q.sum_sqr_band[b], SAMPLES_SHORT);
+        sp=constrain(sp,0.0f,140.0f);
+        bandSPL[b]=sp; if(sp>bandPeak[b]) bandPeak[b]=sp;
+      }
+
+      // Save this reading to the scrolling history for the chart on the web app
+      splHistory[histIdx]=currentDB;
+      histIdx=(histIdx+1)%HISTORY_LEN;
+      if(histCount<HISTORY_LEN) histCount++;
+
+      buzzerActive=(currentDB>=ALERT_SPL||dosePercent>=ALERT_DOSE);
+    }
+
+    // Print readings to the computer every second so we can check via USB
+    static uint32_t lastSer=0;
+    if(millis()-lastSer>1000){lastSer=millis();
+      Serial.printf("screen=%d SPL:%.1f Leq:%.1f Dose:%.2f%% TWA:%.1f\n",
+        screen,currentDB,leqDB,dosePercent,twaDB);
+    }
+  }
+
+  // Check if someone pressed the reset button — save and clear the session
+  bool rn=digitalRead(RESET_BTN);
+  if(lastReset==HIGH && rn==LOW){delay(50);if(digitalRead(RESET_BTN)==LOW)resetMeasurement();}
+  lastReset=rn;
+
+  // Check if someone pressed the mode button — switch to the next screen
+  static bool lastMode=HIGH;
+  bool mn=digitalRead(MODE_BTN);
+  if(lastMode==HIGH && mn==LOW){
+    delay(50);
+    if(digitalRead(MODE_BTN)==LOW){screen=(screen+1)%NUM_SCREENS;needFullRedraw=true;}
+  }
+  lastMode=mn;
+
+  // Count up the session timer every second
+  if(millis()-lastSecMs>=1000){lastSecMs=millis();sessionSec++;}
+
+  // Refresh the screen — full redraw on screen change, partial update every 200ms
+  if(needFullRedraw){
+    drawScreen();
+  } else if(millis()-lastPartialMs>=200){
+    lastPartialMs=millis();
+    partialUpdate();
+  }
+
+  // Handle any web dashboard requests from connected devices
+  webServer->handleClient();
+}
